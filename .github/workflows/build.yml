@@ -1,0 +1,453 @@
+name: Gerar ISO Fazenda Simulator GS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Criar arquivos do projeto
+        run: |
+          mkdir -p src
+          cat > src/main.c <<'FIM_DO_CODIGO'
+          /*
+           * Fazenda Simulator GS - PSP (PSPSDK) - 3D, mundo aberto
+           * Controles:
+           *   Analogico  : andar          L / R : girar camera
+           *   X          : plantar / colher no canteiro mais proximo
+           *   Quadrado   : comprar semente (perto do mercado, $5)
+           *   Circulo    : vender colheita ($12) e ovos ($4) no mercado
+           *   Triangulo  : coletar ovos (no galinheiro, a oeste)
+           *   Start      : mostrar/esconder ajuda
+           *   Chuva faz as plantas crescerem 2x mais rapido!
+           */
+          #include <pspkernel.h>
+          #include <pspdebug.h>
+          #include <pspdisplay.h>
+          #include <pspctrl.h>
+          #include <pspgu.h>
+          #include <pspgum.h>
+          #include <math.h>
+          #include <string.h>
+
+          PSP_MODULE_INFO("FazendaSimulatorGS", 0, 1, 0);
+          PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+
+          #define BUF_W   512
+          #define SCR_W   480
+          #define SCR_H   272
+          #define FRAME   0x88000
+          #define PI_F    3.14159265f
+          #define WORLD   95.0f
+          #define NPLOTS  12
+          #define NTREES  90
+          #define NCHICK  8
+          #define NDROPS  60
+          #define PEN_X   (-34.0f)
+          #define PEN_Z   (0.0f)
+
+          typedef struct { float nx, ny, nz, x, y, z; } Vtx;
+          #define VTX_TYPE (GU_NORMAL_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+
+          static unsigned int __attribute__((aligned(16))) list[262144];
+          static Vtx __attribute__((aligned(16))) cube[36];
+
+          /* ---------- callbacks de saida ---------- */
+          static int running = 1;
+          static int exit_cb(int a, int b, void *c) { running = 0; return 0; }
+          static int cb_thread(SceSize args, void *argp) {
+              int id = sceKernelCreateCallback("exit", exit_cb, NULL);
+              sceKernelRegisterExitCallback(id);
+              sceKernelSleepThreadCB();
+              return 0;
+          }
+          static void setup_callbacks(void) {
+              int t = sceKernelCreateThread("cb", cb_thread, 0x11, 0xFA0, 0, NULL);
+              if (t >= 0) sceKernelStartThread(t, 0, NULL);
+          }
+
+          /* ---------- cubo unitario (base em y=0, centrado em x/z) ---------- */
+          static void build_cube(void) {
+              static const float F[6][9] = {
+                  { 1, 0, 0,   0, 1, 0,   0, 0, 1},   /* +X */
+                  {-1, 0, 0,   0, 0, 1,   0, 1, 0},   /* -X */
+                  { 0, 1, 0,   0, 0, 1,   1, 0, 0},   /* +Y */
+                  { 0,-1, 0,   1, 0, 0,   0, 0, 1},   /* -Y */
+                  { 0, 0, 1,   1, 0, 0,   0, 1, 0},   /* +Z */
+                  { 0, 0,-1,   0, 1, 0,   1, 0, 0}    /* -Z */
+              };
+              static const int S[6][2] = {{-1,-1},{1,-1},{1,1},{-1,-1},{1,1},{-1,1}};
+              int i = 0;
+              for (int f = 0; f < 6; f++) {
+                  const float *d = F[f];
+                  for (int k = 0; k < 6; k++) {
+                      float su = S[k][0] * 0.5f, sv = S[k][1] * 0.5f;
+                      cube[i].nx = d[0]; cube[i].ny = d[1]; cube[i].nz = d[2];
+                      cube[i].x = d[0]*0.5f + d[3]*su + d[6]*sv;
+                      cube[i].y = 0.5f + d[1]*0.5f + d[4]*su + d[7]*sv;
+                      cube[i].z = d[2]*0.5f + d[5]*su + d[8]*sv;
+                      i++;
+                  }
+              }
+              sceKernelDcacheWritebackAll();
+          }
+
+          /* desenha caixa: posicao (base), escala, rotacao Y, cor ABGR */
+          static void box(float x, float y, float z, float sx, float sy, float sz,
+                          float ry, unsigned int color) {
+              ScePspFVector3 p = {x, y, z}, s = {sx, sy, sz};
+              sceGumMatrixMode(GU_MODEL);
+              sceGumLoadIdentity();
+              sceGumTranslate(&p);
+              sceGumRotateY(ry);
+              sceGumScale(&s);
+              sceGumUpdateMatrix();
+              sceGuColor(color);
+              sceGumDrawArray(GU_TRIANGLES, VTX_TYPE, 36, 0, cube);
+          }
+
+          /* ---------- estado do jogo ---------- */
+          typedef struct { float x, z; int stage; float t; } Plot;
+          static Plot plots[NPLOTS];
+          static float treeX[NTREES], treeZ[NTREES], treeH[NTREES];
+          static float px = 0, pz = 0, pang = 0, cam = 0;
+          static int money = 50, seeds = 5, crops = 0, showHelp = 1;
+          static float gameTime = 0;
+          static char msg[64] = "";
+          static float msgTimer = 0;
+
+          static const float MKT_X = 0.0f, MKT_Z = -14.0f;
+
+          typedef struct { float x, z, tx, tz, ang, t, egg; } Chicken;
+          static Chicken chick[NCHICK];
+          static int eggs = 0, coopEggs = 0;
+          static int raining = 0;
+          static float weatherT = 30.0f;
+
+          static unsigned int seed_rng = 12345;
+          static float frand(void) {
+              seed_rng = seed_rng * 1664525u + 1013904223u;
+              return (float)((seed_rng >> 8) & 0xFFFF) / 65535.0f;
+          }
+
+          static void init_world(void) {
+              for (int i = 0; i < NPLOTS; i++) {
+                  plots[i].x = 8.0f + (i % 4) * 4.0f;
+                  plots[i].z = -4.0f + (i / 4) * 4.0f;
+                  plots[i].stage = 0; plots[i].t = 0;
+              }
+              for (int i = 0; i < NTREES; i++) {
+                  float x, z;
+                  do {
+                      x = (frand() * 2 - 1) * (WORLD - 3);
+                      z = (frand() * 2 - 1) * (WORLD - 3);
+                  } while (sqrtf(x*x + z*z) < 30.0f);
+                  treeX[i] = x; treeZ[i] = z; treeH[i] = 3.0f + frand() * 3.0f;
+              }
+              for (int i = 0; i < NCHICK; i++) {
+                  chick[i].x = PEN_X + (frand() * 2 - 1) * 6.0f;
+                  chick[i].z = PEN_Z + (frand() * 2 - 1) * 6.0f;
+                  chick[i].tx = chick[i].x; chick[i].tz = chick[i].z;
+                  chick[i].ang = frand() * 6.28f;
+                  chick[i].t = frand() * 3.0f;
+                  chick[i].egg = frand() * 25.0f;
+              }
+          }
+
+          static void say(const char *s) {
+              strncpy(msg, s, sizeof(msg) - 1); msg[sizeof(msg) - 1] = 0; msgTimer = 3.0f;
+          }
+
+          static int nearest_plot(void) {
+              int best = -1; float bd = 3.0f;
+              for (int i = 0; i < NPLOTS; i++) {
+                  float dx = plots[i].x - px, dz = plots[i].z - pz;
+                  float d = sqrtf(dx*dx + dz*dz);
+                  if (d < bd) { bd = d; best = i; }
+              }
+              return best;
+          }
+
+          static void update(float dt, const SceCtrlData *pad, unsigned int pressed) {
+              gameTime += dt;
+              if (msgTimer > 0) msgTimer -= dt;
+
+              if (pad->Buttons & PSP_CTRL_LTRIGGER) cam -= 1.8f * dt;
+              if (pad->Buttons & PSP_CTRL_RTRIGGER) cam += 1.8f * dt;
+
+              float dx = (pad->Lx - 128) / 128.0f, dy = (pad->Ly - 128) / 128.0f;
+              if (fabsf(dx) < 0.2f) dx = 0;
+              if (fabsf(dy) < 0.2f) dy = 0;
+              if (dx != 0 || dy != 0) {
+                  float fx = sinf(cam), fz = cosf(cam);
+                  float rx = -cosf(cam), rz = sinf(cam);
+                  float mx = fx * (-dy) + rx * dx, mz = fz * (-dy) + rz * dx;
+                  float speed = 9.0f * dt;
+                  px += mx * speed; pz += mz * speed;
+                  pang = atan2f(mx, mz);
+                  if (px < -WORLD) px = -WORLD;
+                  if (px > WORLD) px = WORLD;
+                  if (pz < -WORLD) pz = -WORLD;
+                  if (pz > WORLD) pz = WORLD;
+              }
+
+              weatherT -= dt;
+              if (weatherT <= 0) {
+                  raining = !raining;
+                  weatherT = raining ? (15.0f + frand() * 15.0f) : (40.0f + frand() * 40.0f);
+                  say(raining ? "Comecou a chover! Plantas crescem 2x." : "A chuva parou.");
+              }
+              float gm = raining ? 2.0f : 1.0f;
+
+              for (int i = 0; i < NCHICK; i++) {
+                  Chicken *c = &chick[i];
+                  c->t -= dt;
+                  if (c->t <= 0) {
+                      c->tx = PEN_X + (frand() * 2 - 1) * 6.5f;
+                      c->tz = PEN_Z + (frand() * 2 - 1) * 6.5f;
+                      c->t = 2.0f + frand() * 4.0f;
+                  }
+                  float cdx = c->tx - c->x, cdz = c->tz - c->z;
+                  float cd = sqrtf(cdx * cdx + cdz * cdz);
+                  if (cd > 0.2f) {
+                      c->x += cdx / cd * 1.2f * dt;
+                      c->z += cdz / cd * 1.2f * dt;
+                      c->ang = atan2f(cdx, cdz);
+                  }
+                  c->egg += dt;
+                  if (c->egg >= 25.0f) { c->egg = 0; if (coopEggs < 24) coopEggs++; }
+              }
+
+              for (int i = 0; i < NPLOTS; i++) {
+                  if (plots[i].stage >= 1 && plots[i].stage < 3) {
+                      plots[i].t += dt * gm;
+                      if (plots[i].t >= 12.0f) { plots[i].t = 0; plots[i].stage++; }
+                  }
+              }
+
+              if (pressed & PSP_CTRL_START) showHelp = !showHelp;
+
+              if (pressed & PSP_CTRL_TRIANGLE) {
+                  if (fabsf(px - PEN_X) < 9.0f && fabsf(pz - PEN_Z) < 9.0f) {
+                      if (coopEggs > 0) {
+                          eggs += coopEggs; coopEggs = 0; say("Coletou os ovos!");
+                      } else say("Sem ovos por enquanto.");
+                  } else say("Va ate o galinheiro (oeste).");
+              }
+
+              if (pressed & PSP_CTRL_CROSS) {
+                  int i = nearest_plot();
+                  if (i < 0) say("Chegue perto de um canteiro.");
+                  else if (plots[i].stage == 0) {
+                      if (seeds > 0) { seeds--; plots[i].stage = 1; plots[i].t = 0; say("Plantou!"); }
+                      else say("Sem sementes! Compre no mercado.");
+                  } else if (plots[i].stage == 3) {
+                      plots[i].stage = 0; crops++; say("Colheu!");
+                  } else say("Ainda crescendo...");
+              }
+
+              float mdx = px - MKT_X, mdz = pz - MKT_Z;
+              int atMarket = sqrtf(mdx*mdx + mdz*mdz) < 6.0f;
+              if (pressed & PSP_CTRL_SQUARE) {
+                  if (!atMarket) say("Va ate o mercado.");
+                  else if (money >= 5) { money -= 5; seeds++; say("Comprou 1 semente (-$5)"); }
+                  else say("Dinheiro insuficiente.");
+              }
+              if (pressed & PSP_CTRL_CIRCLE) {
+                  if (!atMarket) say("Va ate o mercado.");
+                  else if (crops > 0 || eggs > 0) {
+                      money += crops * 12 + eggs * 4; crops = 0; eggs = 0; say("Vendeu tudo!");
+                  }
+                  else say("Nada para vender.");
+              }
+          }
+
+          static void fence_line(float x1, float z1, float x2, float z2) {
+              float dx = x2 - x1, dz = z2 - z1;
+              float len = sqrtf(dx * dx + dz * dz);
+              float ang = atan2f(dx, dz);
+              float mx = (x1 + x2) * 0.5f, mz = (z1 + z2) * 0.5f;
+              int n = (int)(len / 4.0f);
+              if (n < 1) n = 1;
+              box(mx, 0.35f, mz, 0.12f, 0.12f, len, ang, 0xff3a6a9a);
+              box(mx, 0.75f, mz, 0.12f, 0.12f, len, ang, 0xff3a6a9a);
+              for (int i = 0; i <= n; i++)
+                  box(x1 + dx * i / n, 0, z1 + dz * i / n, 0.25f, 1.0f, 0.25f, 0, 0xff2a4a70);
+          }
+
+          static void draw_scene(void) {
+              /* ciclo dia/noite: 150 s */
+              float day = 0.5f + 0.5f * cosf(gameTime * 2.0f * PI_F / 150.0f); /* 1=dia */
+              float b = 0.25f + 0.75f * day;
+              if (raining) b *= 0.7f;
+
+              unsigned int sky = 0xff000000
+                  | ((unsigned int)(235 * b) << 16) | ((unsigned int)(190 * b) << 8) | (unsigned int)(110 * b);
+              sceGuClearColor(sky);
+              sceGuClearDepth(0);
+              sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT | GU_FAST_CLEAR_BIT);
+
+              sceGumMatrixMode(GU_PROJECTION);
+              sceGumLoadIdentity();
+              sceGumPerspective(70.0f, 16.0f / 9.0f, 0.5f, 200.0f);
+
+              sceGumMatrixMode(GU_VIEW);
+              sceGumLoadIdentity();
+              ScePspFVector3 eye = { px - sinf(cam) * 11.0f, 7.0f, pz - cosf(cam) * 11.0f };
+              ScePspFVector3 ctr = { px, 1.5f, pz };
+              ScePspFVector3 up  = { 0, 1, 0 };
+              sceGumLookAt(&eye, &ctr, &up);
+
+              sceGuEnable(GU_LIGHTING);
+              sceGuEnable(GU_LIGHT0);
+              ScePspFVector3 dir = { -0.4f, -1.0f, -0.3f };
+              sceGuLight(0, GU_DIRECTIONAL, GU_DIFFUSE, &dir);
+              unsigned int lc = 0xff000000 | ((unsigned int)(255*b) << 16) | ((unsigned int)(255*b) << 8) | (unsigned int)(255*b);
+              sceGuLightColor(0, GU_DIFFUSE, lc);
+              sceGuAmbient(0xff000000 | ((unsigned int)(90*b) << 16) | ((unsigned int)(90*b) << 8) | (unsigned int)(90*b));
+              sceGuColorMaterial(GU_AMBIENT | GU_DIFFUSE);
+
+              /* chao */
+              box(0, -0.5f, 0, WORLD * 2.2f, 0.5f, WORLD * 2.2f, 0, 0xff3c9a3c);
+              /* estrada ate o mercado */
+              box(0, 0.02f, -7, 3, 0.05f, 14, 0, 0xff6f8fa8);
+
+              /* canteiros e plantas */
+              for (int i = 0; i < NPLOTS; i++) {
+                  Plot *p = &plots[i];
+                  box(p->x, 0.03f, p->z, 3.0f, 0.15f, 3.0f, 0, 0xff2a4a6b);
+                  if (p->stage == 1) box(p->x, 0.15f, p->z, 0.4f, 0.4f, 0.4f, 0, 0xff30c030);
+                  else if (p->stage == 2) box(p->x, 0.15f, p->z, 0.8f, 1.0f, 0.8f, 0, 0xff20b040);
+                  else if (p->stage == 3) {
+                      box(p->x, 0.15f, p->z, 1.0f, 1.2f, 1.0f, 0, 0xff20a030);
+                      box(p->x, 1.2f, p->z, 0.9f, 0.7f, 0.9f, 0, 0xff1e50e8); /* fruto */
+                  }
+              }
+
+              /* celeiro */
+              box(-14, 0, -10, 8, 4.5f, 6, 0, 0xff2828b0);
+              box(-14, 4.5f, -10, 8.4f, 1.5f, 6.4f, 0, 0xff303030);
+              /* casa */
+              box(-14, 0, 8, 6, 3.5f, 6, 0, 0xffa8c8e8);
+              box(-14, 3.5f, 8, 6.6f, 1.2f, 6.6f, 0, 0xff204080);
+              /* mercado */
+              box(MKT_X - 2, 0, MKT_Z, 0.4f, 3, 0.4f, 0, 0xff204060);
+              box(MKT_X + 2, 0, MKT_Z, 0.4f, 3, 0.4f, 0, 0xff204060);
+              box(MKT_X, 1.0f, MKT_Z, 4.4f, 0.8f, 1.5f, 0, 0xff3090d0);
+              box(MKT_X, 3.0f, MKT_Z, 5.5f, 0.3f, 3.0f, 0, 0xff2020d0);
+
+              /* cerca da plantacao */
+              fence_line(5, -8, 23, -8);
+              fence_line(23, -8, 23, 8);
+              fence_line(23, 8, 5, 8);
+              fence_line(5, 8, 5, -8);
+
+              /* galinheiro: cerca, casinha e galinhas */
+              fence_line(PEN_X - 8, PEN_Z - 8, PEN_X + 8, PEN_Z - 8);
+              fence_line(PEN_X + 8, PEN_Z - 8, PEN_X + 8, PEN_Z + 8);
+              fence_line(PEN_X + 8, PEN_Z + 8, PEN_X - 8, PEN_Z + 8);
+              fence_line(PEN_X - 8, PEN_Z + 8, PEN_X - 8, PEN_Z - 8);
+              box(PEN_X - 5, 0, PEN_Z - 5, 3.0f, 2.0f, 3.0f, 0, 0xff4070c0);
+              box(PEN_X - 5, 2.0f, PEN_Z - 5, 3.4f, 0.8f, 3.4f, 0, 0xff202080);
+              for (int i = 0; i < NCHICK; i++) {
+                  Chicken *c = &chick[i];
+                  box(c->x, 0.15f, c->z, 0.5f, 0.4f, 0.7f, c->ang, 0xfff0f0f0);
+                  box(c->x + sinf(c->ang) * 0.4f, 0.45f, c->z + cosf(c->ang) * 0.4f,
+                      0.25f, 0.3f, 0.25f, c->ang, 0xff2020e0);
+              }
+              for (int i = 0; i < coopEggs && i < 24; i++)
+                  box(PEN_X + 3.0f + (i % 6) * 0.5f, 0.05f, PEN_Z + 6.0f - (i / 6) * 0.5f,
+                      0.25f, 0.3f, 0.25f, 0, 0xffd0f0ff);
+
+              /* arvores */
+              for (int i = 0; i < NTREES; i++) {
+                  float tdx = treeX[i] - px, tdz = treeZ[i] - pz;
+                  if (tdx * tdx + tdz * tdz > 90.0f * 90.0f) continue;
+                  box(treeX[i], 0, treeZ[i], 0.8f, treeH[i], 0.8f, 0, 0xff204060);
+                  box(treeX[i], treeH[i] - 0.5f, treeZ[i], 3.2f, 2.8f, 3.2f, 0.4f * i, 0xff208030);
+              }
+
+              /* jogador */
+              box(px, 0.0f, pz, 0.9f, 1.4f, 0.6f, pang, 0xffd04020);
+              box(px, 1.4f, pz, 0.6f, 0.6f, 0.6f, pang, 0xff90b8f0);
+              box(px, 2.0f, pz, 0.8f, 0.15f, 0.8f, pang, 0xff40a0e0); /* chapeu */
+
+              /* chuva */
+              if (raining) {
+                  for (int i = 0; i < NDROPS; i++) {
+                      float ox = ((i * 37) % 31) - 15.0f;
+                      float oz = ((i * 53) % 29) - 14.0f;
+                      float y = 14.0f - fmodf((i * 1.7f) + gameTime * 18.0f, 14.0f);
+                      box(px + ox, y, pz + oz, 0.05f, 0.7f, 0.05f, 0, 0xffffc8a0);
+                  }
+              }
+
+              sceGuDisable(GU_LIGHTING);
+          }
+
+          static void draw_hud(int drawOffset) {
+              pspDebugScreenSetOffset(drawOffset);
+              pspDebugScreenSetXY(0, 0);
+              pspDebugScreenPrintf(" FAZENDA SIMULATOR GS  $%d  Sem:%d  Col:%d  Ovos:%d\n", money, seeds, crops, eggs);
+              pspDebugScreenPrintf(" Dia %d  %s  (ovos no galinheiro: %d)\n",
+                                   (int)(gameTime / 150.0f) + 1, raining ? "CHUVA" : "Sol", coopEggs);
+              if (msgTimer > 0) { pspDebugScreenSetXY(1, 3); pspDebugScreenPrintf("%s", msg); }
+              if (showHelp) {
+                  pspDebugScreenSetXY(0, 30);
+                  pspDebugScreenPrintf(" Analog:andar L/R:camera X:plantar/colher\n"
+                                       " []:comprar semente  O:vender (mercado)\n"
+                                       " /\\:coletar ovos (galinheiro)  START:ajuda");
+              }
+          }
+
+          int main(void) {
+              setup_callbacks();
+              pspDebugScreenInit();
+
+              sceCtrlSetSamplingCycle(0);
+              sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+
+              build_cube();
+              init_world();
+
+              sceGuInit();
+              sceGuStart(GU_DIRECT, list);
+              sceGuDrawBuffer(GU_PSM_8888, (void *)0, BUF_W);
+              sceGuDispBuffer(SCR_W, SCR_H, (void *)FRAME, BUF_W);
+              sceGuDepthBuffer((void *)(FRAME * 2), BUF_W);
+              sceGuOffset(2048 - (SCR_W / 2), 2048 - (SCR_H / 2));
+              sceGuViewport(2048, 2048, SCR_W, SCR_H);
+              sceGuDepthRange(65535, 0);
+              sceGuScissor(0, 0, SCR_W, SCR_H);
+              sceGuEnable(GU_SCISSOR_TEST);
+              sceGuDepthFunc(GU_GEQUAL);
+              sceGuEnable(GU_DEPTH_TEST);
+              sceGuShadeModel(GU_SMOOTH);
+              sceGuEnable(GU_CLIP_PLANES);
+              sceGuFinish();
+              sceGuSync(0, 0);
+              sceDisplayWaitVblankStart();
+              sceGuDisplay(GU_TRUE);
+
+              SceCtrlData pad; memset(&pad, 0, sizeof(pad));
+              unsigned int oldButtons = 0;
+              unsigned int last = sceKernelGetSystemTimeLow();
+              int drawOffset = 0;
+
+              while (running) {
+                  unsigned int now = sceKernelGetSystemTimeLow();
+                  float dt = (now - last) / 1000000.0f; last = now;
+                  if (dt > 0.1f) dt = 0.1f;
+
+                  sceCtrlPeekBufferPositive(&pad, 1);
+                  unsigned int pressed = pad.Buttons & ~oldButtons;
+                  oldButtons = pad.Buttons;
+
+                  update(dt, &pad, pressed);
+
+                  sceGuStart(GU_DIRECT, list);
+                  
