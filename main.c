@@ -704,7 +704,7 @@ static void player_attack(void) {
     int w = curW, ai = wAmmo[w];
     float rng = wRange[w];
     if (ai >= 0 && inv[ai] <= 0) { say("Sem municao!"); play_sfx(10); attackCD = 0.3f; return; }
-    int t = aim_target(ai >= 0 ? rng : 3.8f, ai >= 0 ? 1.1f : 2.2f);
+    int t = aim_target(ai >= 0 ? rng : 3.8f, ai >= 0 ? 1.1f : 3.2f);
     if (t >= 0) pang = atan2f(zomb[t].x - px, zomb[t].z - pz);
     float fx = sinf(pang), fz = cosf(pang);
     attackCD = wCD[w];
